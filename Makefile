@@ -16,3 +16,11 @@ run: build
 
 test:
 	@go test ./...
+
+.PHONY: test-network
+test-network:
+	./test_network.sh
+
+.PHONY: clean
+clean:
+	rm -f downloaded_* large_test.txt

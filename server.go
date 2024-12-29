@@ -480,6 +480,22 @@ func (s *FileServer) DownloadFile(fileID string) error {
 		return fmt.Errorf("failed to get metadata: %v", err)
 	}
 
+	// Initialize piece manager
+	pieceManager := NewPieceManager(meta.NumChunks, meta.ChunkHashes)
+
+	// Initialize piece availability for each peer
+	s.mu.RLock()
+	for addr := range s.peers {
+		// For now, assume all peers have all pieces
+		// In a real implementation, we'd query peers for their piece availability
+		pieces := make([]int, meta.NumChunks)
+		for i := 0; i < meta.NumChunks; i++ {
+			pieces[i] = i
+		}
+		pieceManager.UpdatePeerPieces(addr, pieces)
+	}
+	s.mu.RUnlock()
+
 	outputFileName := fmt.Sprintf("downloaded_%s%s", fileID, meta.FileExtension)
 	outputFile, err := os.Create(outputFileName)
 	if err != nil {
@@ -487,23 +503,54 @@ func (s *FileServer) DownloadFile(fileID string) error {
 	}
 	defer outputFile.Close()
 
-	// Log current peers before download
-	s.mu.RLock()
-	log.Printf("Current peers before download: %d", len(s.peers))
-	for addr := range s.peers {
-		log.Printf("Connected to peer: %s", addr)
-	}
-	s.mu.RUnlock()
+	// Create a wait group for parallel downloads
+	var wg sync.WaitGroup
+	errorChan := make(chan error, meta.NumChunks)
+	maxParallelDownloads := 5 // Adjust based on your needs
 
-	for chunk := 0; chunk < meta.NumChunks; chunk++ {
-		if err := s.downloadChunk(fileID, chunk, meta.ChunkSize, outputFile); err != nil {
-			return fmt.Errorf("failed to download chunk %d: %v", chunk, err)
+	for !pieceManager.IsComplete() {
+		pieces := pieceManager.GetNextPieces(maxParallelDownloads)
+		if len(pieces) == 0 {
+			break
+		}
+
+		for _, piece := range pieces {
+			wg.Add(1)
+			go func(p PieceInfo) {
+				defer wg.Done()
+
+				// Try to download the piece with retries
+				var lastErr error
+				for retries := 0; retries < 3; retries++ {
+					if err := s.downloadChunk(fileID, p.Index, meta.ChunkSize, outputFile); err != nil {
+						lastErr = err
+						pieceManager.MarkPieceStatus(p.Index, PieceMissing)
+						time.Sleep(time.Second * time.Duration(retries+1))
+						continue
+					}
+					pieceManager.MarkPieceStatus(p.Index, PieceVerified)
+					return
+				}
+				errorChan <- fmt.Errorf("failed to download piece %d after retries: %v", p.Index, lastErr)
+			}(piece)
+		}
+	}
+
+	// Wait for all downloads to complete
+	wg.Wait()
+	close(errorChan)
+
+	// Check for any errors
+	for err := range errorChan {
+		if err != nil {
+			os.Remove(outputFileName)
+			return fmt.Errorf("download failed: %v", err)
 		}
 	}
 
 	// Verify the complete file
 	if err := s.verifyDownloadedFile(outputFileName, meta.TotalHash); err != nil {
-		os.Remove(outputFileName) // Clean up the corrupted file
+		os.Remove(outputFileName)
 		return fmt.Errorf("file verification failed: %v", err)
 	}
 
