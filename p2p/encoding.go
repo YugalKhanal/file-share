@@ -1,6 +1,7 @@
 package p2p
 
 import (
+	"encoding/binary"
 	"encoding/gob"
 	"fmt"
 	"io"
@@ -20,33 +21,23 @@ type DefaultDecoder struct{}
 
 // In encoding.go - Update the DefaultDecoder
 func (dec DefaultDecoder) Decode(r io.Reader, msg *RPC) error {
-	// Read the first byte to check for stream flag
-	peekBuf := make([]byte, 1)
-	n, err := r.Read(peekBuf)
-	if err != nil {
-		if err == io.EOF {
-			return err
-		}
-		return fmt.Errorf("error reading message type: %v", err)
-	}
-	if n != 1 {
-		return fmt.Errorf("unexpected number of bytes read: %d", n)
+	// Read message length first (4 bytes)
+	var length uint32
+	if err := binary.Read(r, binary.BigEndian, &length); err != nil {
+		return fmt.Errorf("failed to read message length: %v", err)
 	}
 
-	// Handle stream messages
-	if peekBuf[0] == IncomingStream {
-		msg.Stream = true
-		return nil
+	// Sanity check for message length
+	if length > 1024*1024*32 { // 32MB max message size
+		return fmt.Errorf("invalid message length: %d", length)
 	}
 
-	// For regular messages, read the entire payload
-	buf := make([]byte, 4096)
-	n, err = r.Read(buf)
-	if err != nil && err != io.EOF {
-		return fmt.Errorf("error reading message payload: %v", err)
+	// Read the payload
+	payload := make([]byte, length)
+	if _, err := io.ReadFull(r, payload); err != nil {
+		return fmt.Errorf("failed to read payload: %v", err)
 	}
 
-	// Include the first byte we peeked at
-	msg.Payload = append([]byte{peekBuf[0]}, buf[:n]...)
+	msg.Payload = payload
 	return nil
 }

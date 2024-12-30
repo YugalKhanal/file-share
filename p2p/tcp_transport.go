@@ -1,6 +1,7 @@
 package p2p
 
 import (
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -35,6 +36,13 @@ func (p *TCPPeer) CloseStream() {
 }
 
 func (p *TCPPeer) Send(b []byte) error {
+	// Write length prefix first
+	length := uint32(len(b))
+	if err := binary.Write(p.Conn, binary.BigEndian, length); err != nil {
+		return fmt.Errorf("failed to write message length: %v", err)
+	}
+
+	// Write payload
 	_, err := p.Conn.Write(b)
 	return err
 }

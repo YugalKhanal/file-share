@@ -24,3 +24,4 @@ test-network:
 .PHONY: clean
 clean:
 	rm -f downloaded_* large_test.txt
+	rm -rf shared_files/

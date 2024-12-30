@@ -233,11 +233,25 @@ func (s *FileServer) consumeRPCMessages() {
 func (s *FileServer) downloadChunk(fileID string, chunkIndex, chunkSize int, output *os.File) error {
 	log.Printf("Starting chunk download for file %s, chunk %d", fileID, chunkIndex)
 
+	// Get metadata and validate chunk boundaries
 	meta, err := s.store.GetMetadata(fileID)
 	if err != nil {
 		return fmt.Errorf("failed to get metadata: %v", err)
 	}
 
+	fileSize := meta.TotalSize
+	startOffset := int64(chunkIndex * chunkSize)
+	if startOffset >= fileSize {
+		return fmt.Errorf("chunk index %d is beyond file size", chunkIndex)
+	}
+
+	endOffset := startOffset + int64(chunkSize)
+	if endOffset > fileSize {
+		endOffset = fileSize
+	}
+	expectedSize := endOffset - startOffset
+
+	// Get available peers
 	s.mu.RLock()
 	peers := make([]p2p.Peer, 0, len(s.peers))
 	for addr, peer := range s.peers {
@@ -250,39 +264,55 @@ func (s *FileServer) downloadChunk(fileID string, chunkIndex, chunkSize int, out
 		return fmt.Errorf("no peers available")
 	}
 
+	// Set up response channel and handler
 	responseChan := make(chan p2p.MessageChunkResponse, 1)
 	defer close(responseChan)
 
-	responseHandler := func(msg p2p.Message) {
-		if msg.Type == "chunk_response" {
-			if resp, ok := msg.Payload.(p2p.MessageChunkResponse); ok {
-				responseChan <- resp
-			}
-		}
-	}
-
 	s.mu.Lock()
-	s.responseHandlers = append(s.responseHandlers, responseHandler)
-	handlerIndex := len(s.responseHandlers) - 1
+	handlerIndex := len(s.responseHandlers)
+	s.responseHandlers = append(s.responseHandlers, func(msg p2p.Message) {
+		if msg.Type != p2p.MessageTypeChunkResponse {
+			return
+		}
+
+		// Handle both pointer and value types
+		var resp p2p.MessageChunkResponse
+		switch payload := msg.Payload.(type) {
+		case p2p.MessageChunkResponse:
+			resp = payload
+		case *p2p.MessageChunkResponse:
+			resp = *payload
+		default:
+			log.Printf("Invalid chunk response payload type: %T", msg.Payload)
+			return
+		}
+
+		if resp.FileID != fileID || resp.Chunk != chunkIndex {
+			return
+		}
+
+		select {
+		case responseChan <- resp:
+		default:
+			// Channel is full or closed
+		}
+	})
 	s.mu.Unlock()
 
+	// Clean up handler when done
 	defer func() {
 		s.mu.Lock()
-		s.responseHandlers = append(s.responseHandlers[:handlerIndex], s.responseHandlers[handlerIndex+1:]...)
+		if handlerIndex < len(s.responseHandlers) {
+			s.responseHandlers = append(s.responseHandlers[:handlerIndex], s.responseHandlers[handlerIndex+1:]...)
+		}
 		s.mu.Unlock()
 	}()
 
+	// Try downloading from each peer
 	for _, peer := range peers {
 		log.Printf("Attempting to download chunk %d from peer %s", chunkIndex, peer.RemoteAddr())
 
-		msg := p2p.Message{
-			Type: "chunk_request",
-			Payload: p2p.MessageChunkRequest{
-				FileID: fileID,
-				Chunk:  chunkIndex,
-			},
-		}
-
+		msg := p2p.NewChunkRequestMessage(fileID, chunkIndex)
 		var buf bytes.Buffer
 		if err := gob.NewEncoder(&buf).Encode(msg); err != nil {
 			log.Printf("Error encoding request: %v", err)
@@ -290,68 +320,61 @@ func (s *FileServer) downloadChunk(fileID string, chunkIndex, chunkSize int, out
 		}
 
 		if err := peer.Send(buf.Bytes()); err != nil {
-			log.Printf("Error sending request: %v", err)
+			log.Printf("Error sending request to peer %s: %v", peer.RemoteAddr(), err)
 			continue
 		}
 
+		// Wait for response
 		select {
 		case resp := <-responseChan:
-			if resp.FileID != fileID || resp.Chunk != chunkIndex {
-				log.Printf("Received mismatched chunk data")
+			// Verify response size
+			if int64(len(resp.Data)) > expectedSize {
+				log.Printf("Received oversized chunk data from peer %s", peer.RemoteAddr())
 				continue
 			}
 
 			// Verify chunk hash
-			if !verifyChunk(resp.Data, meta.ChunkHashes[chunkIndex]) {
-				log.Printf("Chunk verification failed for chunk %d", chunkIndex)
-				continue
+			if chunkIndex < len(meta.ChunkHashes) {
+				if !verifyChunk(resp.Data, meta.ChunkHashes[chunkIndex]) {
+					log.Printf("Chunk verification failed for chunk %d from peer %s", chunkIndex, peer.RemoteAddr())
+					continue
+				}
 			}
 
-			offset := int64(chunkIndex * chunkSize)
-			bytesWritten, err := output.WriteAt(resp.Data, offset)
+			// Write chunk data
+			written, err := output.WriteAt(resp.Data, startOffset)
 			if err != nil {
-				log.Printf("Error writing chunk to file: %v", err)
+				log.Printf("Error writing chunk data: %v", err)
 				continue
 			}
 
-			log.Printf("Successfully wrote verified chunk %d (%d bytes)", chunkIndex, bytesWritten)
+			if int64(written) != int64(len(resp.Data)) {
+				log.Printf("Incomplete chunk write: wrote %d of %d bytes", written, len(resp.Data))
+				continue
+			}
+
+			log.Printf("Successfully wrote verified chunk %d (%d bytes)", chunkIndex, written)
 			return nil
 
-		case <-time.After(5 * time.Second):
-			log.Printf("Timeout waiting for response from peer")
+		case <-time.After(10 * time.Second):
+			log.Printf("Timeout waiting for response from peer %s", peer.RemoteAddr())
 			continue
 		}
 	}
 
-	return fmt.Errorf("failed to download chunk from any peer")
+	return fmt.Errorf("failed to download chunk %d from any peer", chunkIndex)
 }
 
 // New method to handle RPC messages
 func (s *FileServer) handleRPCMessage(rpc p2p.RPC) error {
-	decoder := gob.NewDecoder(bytes.NewReader(rpc.Payload))
+	// Decode the basic message structure
 	var msg p2p.Message
-
+	decoder := gob.NewDecoder(bytes.NewReader(rpc.Payload))
 	if err := decoder.Decode(&msg); err != nil {
-		log.Printf("Error: Failed to decode message: %v", err)
 		return fmt.Errorf("decode error: %v", err)
 	}
 
-	log.Printf("Successfully decoded message of type: %s", msg.Type)
-
-	// If this is a response, try the response handlers first
-	if msg.Type == "chunk_response" {
-		s.mu.RLock()
-		handlers := make([]func(p2p.Message), len(s.responseHandlers))
-		copy(handlers, s.responseHandlers)
-		s.mu.RUnlock()
-
-		for _, handler := range handlers {
-			handler(msg)
-		}
-		return nil
-	}
-
-	// Otherwise, handle as a request
+	// Get peer information
 	normalizedAddr := p2p.NormalizeAddress(rpc.From)
 	s.mu.RLock()
 	peer, exists := s.peers[normalizedAddr]
@@ -362,12 +385,25 @@ func (s *FileServer) handleRPCMessage(rpc p2p.RPC) error {
 	}
 
 	switch msg.Type {
-	case "chunk_request":
-		req, ok := msg.Payload.(p2p.MessageChunkRequest)
-		if !ok {
-			return fmt.Errorf("invalid payload type for chunk_request")
+	case p2p.MessageTypeChunkRequest:
+		// Try both pointer and value type assertions
+		switch req := msg.Payload.(type) {
+		case p2p.MessageChunkRequest:
+			return s.handleChunkRequest(peer, req)
+		case *p2p.MessageChunkRequest:
+			return s.handleChunkRequest(peer, *req)
+		default:
+			return fmt.Errorf("invalid chunk request payload type: %T", msg.Payload)
 		}
-		return s.handleChunkRequest(peer, req)
+
+	case p2p.MessageTypeChunkResponse:
+		s.mu.RLock()
+		for _, handler := range s.responseHandlers {
+			handler(msg)
+		}
+		s.mu.RUnlock()
+		return nil
+
 	default:
 		return fmt.Errorf("unknown message type: %s", msg.Type)
 	}

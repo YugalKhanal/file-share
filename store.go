@@ -17,7 +17,8 @@ import (
 	"github.com/anthdm/foreverstore/shared"
 )
 
-const ChunkSize = 1024 * 1024
+// const ChunkSize = 1024 * 1024
+const ChunkSize = 1024 * 1024 * 16 // 16MB chunks instead of 1MB
 
 type Metadata struct {
 	FileID        string
@@ -77,26 +78,17 @@ func (s *FileServer) handleChunkRequest(peer p2p.Peer, req p2p.MessageChunkReque
 		return err
 	}
 
-	// Read the chunk directly from the original file
-	filePath := meta.OriginalPath // original file path in metadata struct in types.go
-
-	chunkData, err := s.store.ReadChunk(filePath, req.Chunk)
+	chunkData, err := s.store.ReadChunk(meta.OriginalPath, req.Chunk)
 	if err != nil {
 		log.Printf("Error reading chunk: %v", err)
 		return err
 	}
 
-	msg := p2p.Message{
-		Type: "chunk_response",
-		Payload: p2p.MessageChunkResponse{
-			FileID: req.FileID,
-			Chunk:  req.Chunk,
-			Data:   chunkData,
-		},
-	}
+	msg := p2p.NewChunkResponseMessage(req.FileID, req.Chunk, chunkData)
 
 	var buf bytes.Buffer
-	if err := gob.NewEncoder(&buf).Encode(msg); err != nil {
+	enc := gob.NewEncoder(&buf)
+	if err := enc.Encode(msg); err != nil {
 		log.Printf("Error encoding response: %v", err)
 		return err
 	}
@@ -106,6 +98,7 @@ func (s *FileServer) handleChunkRequest(peer p2p.Peer, req p2p.MessageChunkReque
 		return err
 	}
 
+	log.Printf("Successfully sent chunk %d (%d bytes)", req.Chunk, len(chunkData))
 	return nil
 }
 
@@ -116,21 +109,38 @@ func (s *Store) ReadChunk(filePath string, chunkIndex int) ([]byte, error) {
 	}
 	defer file.Close()
 
-	// Seek to the correct chunk position
-	offset := int64(chunkIndex * ChunkSize)
-	_, err = file.Seek(offset, 0)
+	// Get file size
+	fileInfo, err := file.Stat()
 	if err != nil {
-		return nil, fmt.Errorf("failed to seek to chunk: %v", err)
+		return nil, fmt.Errorf("failed to get file info: %v", err)
+	}
+
+	// Calculate chunk boundaries
+	startOffset := int64(chunkIndex * ChunkSize)
+	if startOffset >= fileInfo.Size() {
+		return nil, fmt.Errorf("chunk start offset exceeds file size")
+	}
+
+	endOffset := startOffset + int64(ChunkSize)
+	if endOffset > fileInfo.Size() {
+		endOffset = fileInfo.Size()
+	}
+
+	chunkSize := endOffset - startOffset
+
+	// Seek to the chunk position
+	if _, err := file.Seek(startOffset, 0); err != nil {
+		return nil, fmt.Errorf("failed to seek to chunk position: %v", err)
 	}
 
 	// Read the chunk
-	buf := make([]byte, ChunkSize)
-	n, err := file.Read(buf)
-	if err != nil && err != io.EOF {
+	chunk := make([]byte, chunkSize)
+	n, err := io.ReadFull(file, chunk)
+	if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
 		return nil, fmt.Errorf("failed to read chunk: %v", err)
 	}
 
-	return buf[:n], nil
+	return chunk[:n], nil
 }
 
 // ChunkAndStore divides a file into chunks, stores each chunk,
